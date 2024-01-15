@@ -1,0 +1,812 @@
+
+
+#include "pch.h"
+#include "IoQueue.h"
+#include "IoProvider.h"
+#include "SerialIo.h"
+
+
+BOOL CSerialIo::CreateInstance(IIoProvider **instance)
+{
+    CSerialIo *pNewInstance = new CSerialIo();
+
+    if (pNewInstance != NULL)
+    {
+        *instance = pNewInstance;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+class CSerialIoListener
+{
+public:
+
+    CSerialIoListener(
+        __in HANDLE      ioHandle,
+        __in CIoQueue    &ioQueue,
+        __in HANDLE      startIoSemaphore,
+        __in SIZE_T      maxTransferSize = 4096);
+
+    BOOL Start();
+    VOID Stop();
+
+private:
+
+    //
+    // Io worker functor
+    //
+    DWORD  IoWorker();
+
+    //
+    // wrapper for member function
+    //
+    static  DWORD WINAPI IoWorkerThread(CSerialIoListener *lpThis) { 
+        return lpThis->IoWorker();
+    }
+
+    HANDLE          m_hThread;
+    LONG            m_bStopFlag;         // stop flag
+    HANDLE          m_hStopEvent;        // stop event
+    HANDLE          m_hIoHandle;         // IO handle for device
+    HANDLE          m_hIoEvent;          // thread IO event
+    HANDLE          m_StartIoSemaphore;  // start IO semaphore shared by listeners
+    SIZE_T          m_MaxTransferSize;
+    OVERLAPPED      m_overlapped;
+
+    CIoQueue        &m_ioQueue;
+    PVOID           m_pReadBuffer;
+
+};
+
+///////////////////////////////////////////////////////////////////
+//  L I S T E N E R   F O R   I N C O M I N G   R E Q U E S T S  //
+///////////////////////////////////////////////////////////////////
+CSerialIoListener::CSerialIoListener(
+    __in HANDLE      ioHandle,
+    __in CIoQueue    &ioQueue,
+    __in HANDLE      startIoSemaphore,
+    __in SIZE_T      maxTransferSize)
+    : m_hThread(NULL)
+    , m_hIoHandle(ioHandle)
+    , m_hStopEvent(NULL)
+    , m_pReadBuffer(NULL)
+    , m_bStopFlag(FALSE)
+    , m_ioQueue(ioQueue)
+    , m_StartIoSemaphore(startIoSemaphore)
+    , m_MaxTransferSize(maxTransferSize)
+{
+    memset(&m_overlapped, 0, sizeof(OVERLAPPED));
+}
+
+BOOL
+CSerialIoListener::Start()
+{
+
+    //
+    // thread stop event
+    //
+    m_hStopEvent = ::CreateEvent(NULL, FALSE, FALSE, NULL);
+
+    if (m_hStopEvent == NULL)
+        return FALSE;
+
+    m_hIoEvent = ::CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    if (m_hIoEvent == NULL) {
+
+        goto _fail_close_stopevent;
+    }
+
+    m_pReadBuffer = VirtualAlloc(NULL, m_MaxTransferSize, MEM_COMMIT, PAGE_READWRITE);
+
+    if (m_pReadBuffer == NULL) {
+
+        goto _fail_close_ioevent;
+    }
+
+    m_bStopFlag = FALSE;
+    //
+    // queue dispatch thread
+    //
+    m_hThread = ::CreateThread(
+        NULL,
+        0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(&CSerialIoListener::IoWorkerThread),
+        this,
+        0,
+        NULL);
+
+    if (m_hThread == NULL) {
+
+        goto _fail_free_buffer;
+    }
+
+    return TRUE;
+
+    //
+    // fail part of code
+    //
+_fail_free_buffer:
+    VirtualFree(m_pReadBuffer, NULL, MEM_FREE);
+
+_fail_close_ioevent:
+    CloseHandle(m_hIoEvent);
+
+_fail_close_stopevent:
+    CloseHandle(m_hStopEvent);
+
+    return FALSE;
+}
+
+VOID
+CSerialIoListener::Stop()
+{
+    m_bStopFlag = TRUE;
+
+    SetEvent(m_hStopEvent);
+
+    WaitForSingleObject(m_hThread, INFINITE);
+
+    CloseHandle(m_hThread);
+    m_hThread = NULL;
+
+    CloseHandle(m_hStopEvent);
+    m_hStopEvent = NULL;
+
+    CloseHandle(m_hIoEvent);
+    m_hIoEvent = NULL;
+
+    VirtualFree(m_pReadBuffer, NULL, MEM_FREE);
+    m_pReadBuffer = NULL;
+}
+
+
+DWORD
+CSerialIo::SetupConnection()
+{
+    DCB             stDCB;
+    COMMTIMEOUTS    stCommTimeout;
+
+    //
+    // Initialize queue size
+    //
+    if (::SetupComm(this->m_hConnectionPort, m_dwBuffersSize, m_dwBuffersSize) != TRUE)
+    {
+        return GetLastError();
+    }
+
+    //
+    // default timeouts used by driver to form pooling interval
+    //
+    stCommTimeout.ReadIntervalTimeout = MAXDWORD; // 5 ms
+    stCommTimeout.ReadTotalTimeoutMultiplier = MAXDWORD;
+    stCommTimeout.ReadTotalTimeoutConstant = 5000;
+    //stCommTimeout.ReadIntervalTimeout = 5; // 5 ms
+    //stCommTimeout.ReadTotalTimeoutMultiplier = 0;
+    //stCommTimeout.ReadTotalTimeoutConstant = 0;
+    stCommTimeout.WriteTotalTimeoutMultiplier = 5000;
+    stCommTimeout.WriteTotalTimeoutConstant = 0;
+
+    if (::SetCommTimeouts(this->m_hConnectionPort, &stCommTimeout) != TRUE)
+    {
+        return GetLastError();
+    }
+
+    //
+    // setup COM port main structure
+    //
+    memset(&stDCB, 0, sizeof(DCB));
+    stDCB.DCBlength = sizeof(DCB);
+
+    if (::GetCommState(this->m_hConnectionPort, &stDCB) != TRUE)    
+    {
+        return GetLastError();
+    }
+
+    stDCB.fBinary = TRUE;
+    stDCB.fParity = FALSE;
+    stDCB.fOutxCtsFlow = FALSE;                             // CTS output flow control
+    stDCB.fOutxDsrFlow = FALSE;                             // DSR output flow control
+    stDCB.fDtrControl = DTR_CONTROL_DISABLE;                // DTR flow control type
+    stDCB.fDsrSensitivity = FALSE;
+    stDCB.fTXContinueOnXoff = FALSE;                        // XOFF continues Tx
+    stDCB.fOutX = FALSE;                                    // XON/XOFF out flow control
+    stDCB.fInX = FALSE;                                     // XON/XOFF in flow control
+    stDCB.fErrorChar = FALSE;
+    stDCB.fNull = FALSE;
+    stDCB.fRtsControl = DTR_CONTROL_DISABLE;                // RTS flow control type
+    stDCB.fAbortOnError = FALSE;
+    stDCB.BaudRate = m_dwBoudRate;
+    stDCB.ByteSize = 8;
+    stDCB.Parity = NOPARITY;                                // no parity
+    stDCB.StopBits = ONESTOPBIT;                            // 1 stop bit
+
+    if (::SetCommState(this->m_hConnectionPort, &stDCB) != TRUE)
+    {
+        return GetLastError();
+    }
+
+    return ERROR_SUCCESS;
+}
+
+int
+CSerialIo::SetSpeed(DWORD dwBouds)
+{
+    m_dwBoudRate = dwBouds;
+    return 0;
+}
+
+BOOL
+CSerialIo::Connect(const TCHAR *szSource)
+{
+    COMSTAT     stComStat;
+    DWORD       dwErrors;
+
+    m_CapturedEvent = 0;
+
+    m_hCompleteEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    if (m_hCompleteEvent == NULL)
+    {
+        return FALSE;
+    }
+
+    m_hStartIoSemaphore = CreateSemaphore(NULL, 0, ARRAYSIZE(m_IoListener), NULL);
+
+    if (m_hStartIoSemaphore == NULL)
+    {
+        goto __fail_close_event;
+    }
+
+    if (m_IoReadQueue.Initialize() != TRUE)
+    {
+        goto __fail_close_semaphore;
+    }
+
+    m_hConnectionPort = ::CreateFile(
+        szSource, 
+        GENERIC_READ | GENERIC_WRITE, 
+        0,
+        0, 
+        OPEN_EXISTING, 
+        FILE_FLAG_OVERLAPPED | FILE_ATTRIBUTE_NORMAL,
+        0);
+    
+    if (this->m_hConnectionPort == INVALID_HANDLE_VALUE)
+    {
+        goto __fail_release_queue;
+    }
+
+
+    if (this->SetupConnection() != ERROR_SUCCESS)
+    {
+        goto __fail_close_port;
+    }
+
+    //
+    // initialize listeners on COM port
+    //
+    for (int i = 0; i < ARRAYSIZE(m_IoListener); i++)
+    {
+        m_IoListener[i] = new CSerialIoListener(
+            m_hConnectionPort,
+            m_IoReadQueue,
+            m_hStartIoSemaphore,
+            m_dwBuffersSize);
+
+        if (m_IoListener[i] == NULL)
+        {
+            for (int j = i - 1; j > -1; j--)
+            {
+                delete m_IoListener[j];
+            }
+
+            goto __fail_close_port;
+        }
+    }
+
+    for (int i = 0; i < ARRAYSIZE(m_IoListener); i++)
+    {
+        if (m_IoListener[i]->Start() != TRUE)
+        {
+            for (int j = i - 1; j > -1; j--)
+            {
+                m_IoListener[j]->Stop();
+                delete m_IoListener[j];
+            }
+
+            goto __fail_close_port;
+
+        }
+    }
+
+
+    ::ClearCommError(m_hConnectionPort, &dwErrors, &stComStat );
+    ::ClearCommBreak(m_hConnectionPort);
+
+    ReleaseSemaphore(m_hStartIoSemaphore, 1, NULL);
+
+    return TRUE;
+
+__fail_close_port:
+    CloseHandle(m_hConnectionPort);
+
+__fail_release_queue:
+    m_IoReadQueue.Finalize();
+
+__fail_close_semaphore:
+    CloseHandle(m_hStartIoSemaphore);
+
+__fail_close_event:
+    CloseHandle(m_hCompleteEvent);
+
+    return FALSE;
+}
+
+VOID
+CSerialIo::Disconnect()
+{
+    for (int i = 0; i < ARRAYSIZE(m_IoListener); i++)
+    {
+        m_IoListener[i]->Stop();
+
+        delete m_IoListener[i];
+
+    }
+
+    m_IoReadQueue.Flush();
+
+    if (m_CapturedEvent != 0)
+    {
+        m_IoReadQueue.ReleaseEvent(m_CapturedEvent);
+
+        m_CapturedEvent = 0;
+    }
+
+    CloseHandle(m_hConnectionPort);
+
+
+    m_IoReadQueue.Finalize();
+
+    CloseHandle(m_hStartIoSemaphore);
+
+    CloseHandle(m_hCompleteEvent);
+
+}
+
+
+DWORD
+CSerialIo::ReadAll(void **pData, SIZE_T *nSize, DWORD dwTimeout)
+{
+    SIZE_T  currentSize = 0;
+    SIZE_T  currentPosition = 0;
+
+    m_IoReadQueue.Lock();
+
+    do
+    {
+        if (this->m_CapturedEvent != 0)
+        {
+            currentSize = this->m_CapturedEvent->dataSize;
+        }
+
+        currentSize += m_IoReadQueue.Size();
+
+        if (currentSize > 0)
+            break;
+
+        m_IoReadQueue.Unlock();
+
+        DWORD dwWaitError = m_IoReadQueue.WaitForEvent(0, dwTimeout);
+
+        if (dwWaitError != ERROR_SUCCESS)
+        {
+            return dwWaitError;
+        }
+
+        m_IoReadQueue.Lock();
+    }
+    while (currentSize == 0);
+
+    UCHAR  *buffer = new UCHAR[currentSize];
+
+    if (buffer == NULL)
+    {
+        m_IoReadQueue.Unlock();
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
+
+    do
+    {
+        PQUEUE_EVENT pEvent = 0;
+
+        if (this->m_CapturedEvent != 0)
+        {
+            pEvent = this->m_CapturedEvent;
+            this->m_CapturedEvent = 0;
+        }
+        else
+        {
+            pEvent = m_IoReadQueue.GetEvent();
+        }
+
+        if (pEvent != NULL)
+        {
+            assert((currentPosition + pEvent->dataSize) <= currentSize);
+
+            memcpy(buffer + currentPosition, pEvent->data, pEvent->dataSize);
+
+            currentPosition += pEvent->dataSize;
+
+            m_IoReadQueue.ReleaseEvent(pEvent);
+        }
+        else
+        {
+            break;
+        }
+
+    }
+    while (currentPosition != currentSize);
+
+    *pData = buffer; 
+    *nSize = currentPosition;
+
+    m_IoReadQueue.Unlock();
+
+    return ERROR_SUCCESS;
+}
+
+//
+// release data received
+//
+VOID
+CSerialIo::ReleaseData(void *pData)
+{
+    delete[] pData;
+}
+
+
+DWORD
+CSerialIo::Read(void *pData, SIZE_T nSize, DWORD dwTimeout)
+{
+    SIZE_T  currentPosition = 0;
+    SIZE_T  toRead = nSize;
+
+    if (nSize == 0)
+        return ERROR_SUCCESS;
+
+    memset(pData, 0, toRead);
+
+    m_IoReadQueue.Lock();
+
+    do
+    {
+        PQUEUE_EVENT pEvent = 0;
+
+        if (m_CapturedEvent != NULL)
+        {
+
+            SIZE_T  copySize;
+
+            if (m_CapturedEvent->dataSize > toRead)
+            {
+                copySize = toRead;
+
+                memcpy((UCHAR *)pData + currentPosition, m_CapturedEvent->data, copySize);
+
+                currentPosition += copySize;
+                toRead -= copySize;
+
+                //
+                // shift the date
+                //
+                memcpy(m_CapturedEvent->data, m_CapturedEvent->data + copySize, copySize);
+                m_CapturedEvent->dataSize -= copySize;
+            }
+            else
+            {
+                copySize = m_CapturedEvent->dataSize;
+
+                memcpy((UCHAR *)pData + currentPosition, m_CapturedEvent->data, copySize);
+
+                currentPosition += copySize;
+                toRead -= copySize;
+
+                m_IoReadQueue.ReleaseEvent(m_CapturedEvent);
+                m_CapturedEvent = 0;
+
+            }
+
+        }
+
+        if (0 == toRead)
+        {
+            m_IoReadQueue.Unlock();
+            return ERROR_SUCCESS;
+        }
+
+        if (m_CapturedEvent == 0)
+        {
+            //
+            // try to get new event
+            //
+            pEvent = m_IoReadQueue.GetEvent();
+
+            while (pEvent == 0)
+            {
+                m_IoReadQueue.Unlock();
+
+                DWORD dwWaitError = m_IoReadQueue.WaitForEvent(0, dwTimeout);
+
+                if (dwWaitError != ERROR_SUCCESS)
+                {
+                    return dwWaitError;
+                }
+
+                m_IoReadQueue.Lock();
+
+                pEvent = m_IoReadQueue.GetEvent();
+            }
+
+            m_CapturedEvent = pEvent;
+        }
+
+
+    }
+    while (toRead != 0);
+
+    m_IoReadQueue.Unlock();
+
+    return ERROR_INVALID_PARAMETER;
+}
+
+DWORD
+CSerialIo::Write(const void *pData, SIZE_T nSize, DWORD dwTimeout)
+{
+    DWORD dwWritten = 0;
+
+    DWORD dwError = ERROR_SUCCESS;
+
+    memset(&this->m_OverlappedWrite, 0, sizeof(OVERLAPPED));
+
+    ResetEvent(m_hCompleteEvent);
+    this->m_OverlappedWrite.hEvent = m_hCompleteEvent;
+
+    if (WriteFile(m_hConnectionPort, pData, (DWORD)nSize, &dwWritten, &this->m_OverlappedWrite) != TRUE)
+    {
+
+        dwError = GetLastError();
+
+        if (dwError == ERROR_IO_PENDING)
+        {
+            dwError = WaitForSingleObject(m_hCompleteEvent, dwTimeout);
+
+            if (dwError == ERROR_SUCCESS)
+            {
+
+                GetOverlappedResult(m_hConnectionPort, &this->m_OverlappedWrite, &dwWritten, FALSE);
+
+                return ERROR_SUCCESS;
+            }
+        }
+    }
+
+
+    return dwError;
+}
+
+DWORD
+CSerialIo::Purge()
+{
+    PurgeComm(m_hConnectionPort, PURGE_RXABORT | PURGE_RXCLEAR | PURGE_TXABORT | PURGE_TXCLEAR);
+
+    m_IoReadQueue.Flush();
+
+    return ERROR_SUCCESS;
+}
+
+
+DWORD
+CSerialIoListener::IoWorker()
+{
+
+    HANDLE threadWaitEvents[2];
+    HANDLE IoWaitEvents[2];
+
+    //
+    //  wait for thread started
+    //
+    _TRACE((L"ListenerThread: thread ready\n"));
+
+    do
+    {
+
+        DWORD  dwReaded;
+        DWORD  dwWaitStatus;
+
+        DWORD    dwErrors;
+        COMSTAT  comStat;
+
+        //
+        // check the stop flag
+        //
+        if (this->m_bStopFlag)
+        {
+            _TRACE((L"ListenerThread: stop flag received - exiting\n"));
+            return 0;
+        }
+
+        //
+        // prepare Io structures
+        //
+        memset(&m_overlapped, 0, sizeof(OVERLAPPED));
+
+        ResetEvent(this->m_hIoEvent);
+        m_overlapped.hEvent = this->m_hIoEvent;
+
+        IoWaitEvents[0] = this->m_hIoEvent;
+        IoWaitEvents[1] = this->m_hStopEvent;
+
+        //
+        // wait for ready structure
+        //
+        threadWaitEvents[0] = this->m_StartIoSemaphore;
+        threadWaitEvents[1] = this->m_hStopEvent;
+
+        dwReaded = 0;
+
+        //
+        // We wait until the main thread unlocks IO transfer, either, we get a stop flag.
+        //
+        dwWaitStatus = ::WaitForMultipleObjects(2, threadWaitEvents, FALSE, INFINITE);
+
+        //
+        // we stopped by main thread so bail out
+        //
+        if (dwWaitStatus == (WAIT_OBJECT_0 + 1))
+        {
+            assert(m_bStopFlag == TRUE);
+
+            _TRACE((L"ListenerThread: stop event received - exiting\n"));
+            return 0;
+        }
+
+        //
+        // abadoned status or error
+        //
+        if (dwWaitStatus != WAIT_OBJECT_0)
+        {
+
+            _TRACE((L"ListenerThread: wait for abadoned event - exiting\n"));
+            return (DWORD)-1;
+        }
+
+        _TRACE((L"ListenerThread: starting read operation\n"));
+        //
+        // start overlapped reading
+        //
+        if (::ReadFile(m_hIoHandle, m_pReadBuffer, (DWORD)m_MaxTransferSize, &dwReaded, &m_overlapped) != TRUE)
+        {
+
+            DWORD dwError = GetLastError();
+
+            if (dwError == ERROR_IO_PENDING)
+            {
+                _TRACE((L"ListenerThread: starting to wait on read\n"));
+
+                dwWaitStatus = ::WaitForMultipleObjects(2, IoWaitEvents, FALSE, INFINITE);
+
+
+                if (dwWaitStatus == (WAIT_OBJECT_0 + 1)) {
+
+                    assert(m_bStopFlag == TRUE);
+
+                    //
+                    // cancel Io for this thread and return
+                    //
+                    CancelIo(m_hIoHandle);
+
+                    _TRACE((L"ListenerThread: stop event received - exiting\n"));
+                    return 0;
+                }
+
+                //
+                // abadoned status or error
+                //
+                if (dwWaitStatus != WAIT_OBJECT_0) {
+
+                    CancelIo(m_hIoHandle);
+
+                    ClearCommError(m_hIoHandle, &dwErrors, &comStat);
+
+                    _TRACE((L"ListenerThread: wait on read error (%d)\n", dwWaitStatus));
+                    continue;
+                }
+
+                //
+                // get IO result
+                //
+                GetOverlappedResult(m_hIoHandle, &m_overlapped, &dwReaded, FALSE);
+
+            }
+            else
+            {
+
+                ClearCommError(m_hIoHandle, &dwErrors, &comStat);
+
+                //
+                // some other error, try to retry
+                //
+                _TRACE((L"ListenerThread: wait error (%d)\n", dwError));
+                
+                continue;
+            }
+        }
+
+
+        _TRACE((L"ListenerThread: captured data (%d)\n", dwReaded));
+
+        if (dwReaded > 0)
+        {
+            //
+            // block queue before release other thread
+            //
+            this->m_ioQueue.Lock();
+
+
+            //
+            // unblock other thread and continue to copy data
+            //
+            ReleaseSemaphore(this->m_StartIoSemaphore, 1, NULL);
+
+            //
+            // perform data operations with released semaphore
+            //
+            QUEUE_EVENT *dataEvent = this->m_ioQueue.AllocateEvent(dwReaded);
+
+            //
+            // allocation BUG ?
+            //
+            if (dataEvent == NULL)
+            {
+                _TRACE((L"ListenerThread: allocation error\n"));
+
+                this->m_ioQueue.Unlock();
+                continue;
+            }
+
+
+            //
+            // insert data to queue
+            //
+            dataEvent->dataSize = dwReaded;
+            memcpy(dataEvent->data, m_pReadBuffer, dwReaded);
+
+            this->m_ioQueue.AddEvent(dataEvent);
+
+            this->m_ioQueue.Unlock();
+
+        }
+        else
+        {
+            CancelIo(m_hIoHandle);
+
+            ClearCommError(m_hIoHandle, &dwErrors, &comStat);
+
+            //
+            // unblock other thread and continue to copy data
+            //
+            ReleaseSemaphore(this->m_StartIoSemaphore, 1, NULL);
+
+        }
+
+
+    }
+    while (this->m_bStopFlag != TRUE);
+
+
+    return 0;
+}
+
